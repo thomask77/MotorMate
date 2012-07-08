@@ -1,6 +1,6 @@
 /**
  * Custom brushed motor firmware for some cheap BLDC controller.
- * 
+ *
  * This program is free software;  you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation; either version 3 of
@@ -17,21 +17,21 @@
 #include <avr/wdt.h>
 #include <util/delay.h>
 
-// Reverse-engineerd pinout
+// Reverse-enginered pinout
 //
 #define LS_A    _BV(PD0)
-#define LS_B    _BV(PD1)  
-#define RC_IN   _BV(PD2)  
-#define LS_C    _BV(PD3)  
-#define HS_C    _BV(PD4)  
-#define HS_A    _BV(PD5)  
-#define U_NULL  _BV(PD6)  
-#define HS_B    _BV(PD7)  
-#define U_A     _BV(PC2)  
-#define U_B     _BV(PC3)  
-#define U_C     _BV(PC4)  
+#define LS_B    _BV(PD1)
+#define RC_IN   _BV(PD2)
+#define LS_C    _BV(PD3)
+#define HS_C    _BV(PD4)
+#define HS_A    _BV(PD5)
+#define U_NULL  _BV(PD6)
+#define HS_B    _BV(PD7)
+#define U_A     _BV(PC2)
+#define U_B     _BV(PC3)
+#define U_C     _BV(PC4)
 // #define ???     PC5
-#define U_BAT   ADC7 
+#define U_BAT   ADC7
 
 #define PWM_PERIOD    117     // ca. 8kHz
 #define PWM_MIN       8
@@ -53,7 +53,7 @@ inline void deadtime_1us(void)
 inline void deadtime_8us(void)
 {
     deadtime_1us(); deadtime_1us(); deadtime_1us(); deadtime_1us();
-    deadtime_1us(); deadtime_1us(); deadtime_1us(); deadtime_1us();    
+    deadtime_1us(); deadtime_1us(); deadtime_1us(); deadtime_1us();
 }
 
 ISR(TIMER0_OVF_vect)
@@ -69,7 +69,7 @@ ISR(TIMER0_OVF_vect)
         deadtime_8us();
         PORTD = pwm_out1;
         pwm_state = 1;
-    }        
+    }
     wdt_reset();
 }
 
@@ -91,13 +91,13 @@ void set_pwm(int pwm)
         pwm_dead = LS_A;
         pwm_out0 = LS_A | HS_B;
         pwm_out1 = LS_A | LS_B;
-     }
+    }
     else {
         pwm_dead =        LS_B;
         pwm_out0 = HS_A | LS_B;
         pwm_out1 = LS_A | LS_B;
     }
-    
+
     if (pwm > PWM_MAX)
         pwm_dead = pwm_out1 = pwm_out0;
     if (pwm < PWM_MIN)
@@ -114,7 +114,7 @@ ISR(INT0_vect)
     else {
         rc_pulse = TCNT1;
         rc_rxcount++;
-    }    
+    }
 }
 
 
@@ -123,7 +123,7 @@ int main(void)
     // Enable the watchdog timer
     //
     wdt_enable(WDTO_15MS);
-    
+
     // Initialize output pins
     //
     PORTD = 0;
@@ -142,24 +142,25 @@ int main(void)
     GICR  = _BV(INT0);    // enable interrupt
 
     sei();
-    
+
     _delay_ms(500);
 
     for(;;) {
-        // TODO: 
+        // TODO:
         // * Check battery voltage
         // * Check for RC timeouts
         // * Limit PWM slew rate
         // * Arm/Disarm motors, beep on startup
         // * Can we estimate the motor current?!
-        // 
+        // * Make use of the third output channel
+        //
         cli(); int t = rc_pulse; sei();
 
-        if (t > 500 || t < 2500) {
+        if (t > 500 && t < 2500) {
             int pwm = ((t - 1500) / 500.0) * PWM_MAX;
             set_pwm(pwm);
         }
-       
+
         _delay_ms(10);
     }
 }
