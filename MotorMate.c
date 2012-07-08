@@ -58,17 +58,17 @@ inline void deadtime_8us(void)
 
 ISR(TIMER0_OVF_vect)
 {
-    if (pwm_state) {
+    if (!pwm_state) {
         TCNT0 = pwm_t0;
         deadtime_8us();
         PORTD = pwm_out0;
-        pwm_state = 0;
+        pwm_state = 1;
     }
     else {
         TCNT0 = pwm_t1;
         deadtime_8us();
         PORTD = pwm_out1;
-        pwm_state = 1;
+        pwm_state = 0;
     }
     wdt_reset();
 }
