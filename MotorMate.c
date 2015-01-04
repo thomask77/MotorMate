@@ -1,6 +1,11 @@
 /**
  * Custom brushed motor firmware for some cheap BLDC controller.
  *
+ * Copyright (c)2012 Thomas Kindler <mail@t-kindler.de>
+ *
+ * TODO
+ * - Use LS_C/HS_C as a general purpose output
+ *
  * This program is free software;  you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation; either version 3 of
@@ -10,12 +15,22 @@
 
 // Include files -----
 //
-#define F_CPU   8000000UL
-
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
 #include <util/delay.h>
+
+// Configuration values
+//
+#define U_BAT_MIN       11200   // Minimum battery voltage (in mV)
+#define U_BAT_MAX       17600   // Maximum battery voltage (in mV)
+
+// ADC conversion constants
+//
+#define U_BAT_LSB       (2.56  * ((10000.0 + 390) / 390) / 1024)
+#define U_BAT_GAIN      (17.95 / 17.18)
+
+#define I2C_ADDR_BASE   0x42
 
 // Reverse-engineered pinout
 //
@@ -31,26 +46,41 @@
 #define U_B     _BV(PC3)    // ADC3
 #define U_C     _BV(PC4)    // ADC4
 
+#define BOARD_ID  _BV(PB6)  // BOARD_ID
+
+#define I2C_SDA _BV(PC4)    // Conflicts with U_C -> Remove resistor network
+#define I2C_SCL _BV(PC5)
+
 // Software PWM constants
 //
-#define PWM_PERIOD  117     // ca. 8kHz
-#define PWM_MIN     8
-#define PWM_MAX     (PWM_PERIOD-8)
+#define PWM_TCCR0       2   // 1us timebase
+#define PWM_PERIOD      255 // ca. 4 kHz
 
-// ADC conversion constants
-//
-#define ADC_PER_VOLT    ((1024 / 2.56) / ((10e3 + 390) / 390))
+// #define PWM_TCCR0       2   // 1us timebase
+// #define PWM_PERIOD      117 // ca. 8kHz
 
-#define NUM_CELLS   4
-#define U_BAT_MIN   (3.0 * NUM_CELLS * ADC_PER_VOLT)
+// #define PWM_TCCR0       4   // 32us timebase
+// #define PWM_PERIOD      255 // ca. 125 Hz
+
+#define PWM_MIN         8
+#define PWM_MAX         (PWM_PERIOD-8)
+
+
+#define clamp(x, min, max)      \
+( { typeof (x)   _x   = (x);    \
+    typeof (min) _min = (min);  \
+    typeof (max) _max = (max);  \
+    _x < _min ? _min : (_x > _max ? _max : _x); \
+} )
+
+
+/********** Software-PWM **********/
 
 uint8_t  pwm_state;
 uint8_t  pwm_t0, pwm_out0;
 uint8_t  pwm_t1, pwm_out1;
 uint8_t  pwm_dead;
 
-int16_t  rc_pulse;
-int8_t   rc_rxcount;
 
 static inline void deadtime_1us(void)
 {
@@ -66,17 +96,17 @@ static inline void deadtime_8us(void)
 
 ISR(TIMER0_OVF_vect)
 {
-    if (!pwm_state) {
-        TCNT0 = pwm_t0;
-        deadtime_8us();
-        PORTD = pwm_out0;
-        pwm_state = 1;
-    }
-    else {
+    if (pwm_state) {
         TCNT0 = pwm_t1;
         deadtime_8us();
         PORTD = pwm_out1;
         pwm_state = 0;
+    }
+    else {
+        TCNT0 = pwm_t0;
+        deadtime_8us();
+        PORTD = pwm_out0;
+        pwm_state = 1;
     }
     wdt_reset();
 }
@@ -91,6 +121,8 @@ void set_pwm(int pwm)
     }
     if (pwm > PWM_PERIOD)
         pwm = PWM_PERIOD;
+
+    cli();
 
     pwm_t0 = 255 - pwm;
     pwm_t1 = 255 - (PWM_PERIOD - pwm);
@@ -110,8 +142,15 @@ void set_pwm(int pwm)
         pwm_dead = pwm_out1 = pwm_out0;
     if (pwm < PWM_MIN)
         pwm_dead = pwm_out0 = pwm_out1;
+
+    sei();
 }
 
+
+/********** RC remote receiver **********/
+
+volatile int16_t    _rc_pulse;
+uint8_t    rc_watchdog;
 
 ISR(INT0_vect)
 {
@@ -119,17 +158,82 @@ ISR(INT0_vect)
         TCNT1 = 0;
     }
     else {
-        rc_pulse = TCNT1;
-        rc_rxcount++;
+        _rc_pulse = TCNT1;
+        rc_watchdog = 100;
     }
 }
 
+/********** I2C Slave **********/
+
+uint8_t i2c_pointer;
+uint8_t i2c_data[16];
+uint8_t i2c_state;
+uint8_t i2c_watchdog;
+
+ISR(TWI_vect)
+{
+    uint8_t status = TWSR & 0xF8;
+
+    switch (status) {
+    case 0x60:  // Own SLA+W has been received
+        i2c_state = 0;
+        break;
+
+    case 0x80:  // Data received
+        if (i2c_state == 0) {
+            i2c_pointer = TWDR;
+            i2c_state = 1;
+        }
+        else {
+            if (i2c_pointer >= sizeof(i2c_data))
+                i2c_pointer = 0;
+            i2c_data[i2c_pointer++] = TWDR;
+        }
+        break;
+
+    case 0xA0:  // STOP or repeated START
+        break;
+
+    case 0xA8:  // Own SLA+R has been received
+    case 0xB8:  // Data byte has been transmitted
+        if (i2c_pointer >= sizeof(i2c_data))
+            i2c_pointer = 0;
+        TWDR = i2c_data[i2c_pointer++];
+        break;
+
+    default:    // Error state
+        TWCR |= _BV(TWSTO);
+        break;
+    }
+
+    // Acknowledge interrupt
+    //
+    TWCR |= _BV(TWINT);
+    i2c_watchdog = 100;
+}
+
+
+/********** Main loop **********/
+#define ERR_MASK            0x0F
+#define ERR_UBAT_MIN        0x01
+#define ERR_UBAT_MAX        0x02
+
+#define WARN_MASK           0xF0
+#define WARN_RC_TIMEOUT     0x10
+#define WARN_I2C_TIMEOUT    0x20
+
+uint8_t status;
 
 int main(void)
 {
     // Enable the watchdog timer
     //
     wdt_enable(WDTO_15MS);
+
+    // Set board ID to input w/ pullup
+    //
+    DDRB  = 0;
+    PORTB = BOARD_ID;
 
     // Initialize output pins
     //
@@ -138,7 +242,7 @@ int main(void)
 
     // Use timer 0 for software PWM output
     //
-    TCCR0  = 2;             // 1us timebase
+    TCCR0  = PWM_TCCR0;
     TIMSK |= _BV(TOV0);     // interrupt on overflow
     set_pwm(0);
 
@@ -150,28 +254,105 @@ int main(void)
 
     // Use ADC7 for battery voltage measurement
     // 125kHz ADC Clock / 13 => ~4800 samples/s
-    // Use internal 2.56V reference (TODO: Check this!)
+    // Use internal 2.56V reference
     //
     ADMUX  = _BV(REFS1) | _BV(REFS0) | 7;
     ADCSRA = _BV(ADEN) | _BV(ADSC) | _BV(ADFR) | 7;
 
-    sei();
+    // Enable I2C slave with interrupts
+    //
+    if (PINB & BOARD_ID)
+        TWAR = (I2C_ADDR_BASE + 0) << 1;
+    else
+        TWAR = (I2C_ADDR_BASE + 1) << 1;
     
+    TWCR = _BV(TWEA) | _BV(TWEN) | _BV(TWIE);
+
+    sei();
+
     // Wait for RC receiver to start up, etc..
     //
     _delay_ms(250);
 
+    int pwm_ref  = 100;
+    int pwm_act  = 0;
+    int rc_pulse = 0;
+    int outputs  = 0;
+    int u_bat_mv = 0;
+
     for(;;) {
-        cli(); int t = rc_pulse; sei();
-        int u_bat = ADC;
+        // Check voltage limits and timeouts
+        //
+        u_bat_mv = ADC * 1000L * U_BAT_LSB * U_BAT_GAIN;
 
-        if (u_bat < U_BAT_MIN) {
-            set_pwm(0);
+        if (u_bat_mv < U_BAT_MIN)
+            status |= ERR_UBAT_MIN;
+        if (u_bat_mv > U_BAT_MIN * 1.1)
+            status &= ~ERR_UBAT_MIN;
+
+        if (u_bat_mv > U_BAT_MAX)
+            status |= ERR_UBAT_MAX;
+        if (u_bat_mv < U_BAT_MAX * 0.9)
+            status &= ~ERR_UBAT_MAX;
+
+        if (i2c_watchdog > 0) {
+            i2c_watchdog--;
+            status &= ~WARN_I2C_TIMEOUT;
         }
-        else if (t > 500 && t < 2500) {
-            set_pwm(((t - 1500) / 500.0) * PWM_MAX);
+        else {
+            status |= WARN_I2C_TIMEOUT;
         }
 
-        _delay_ms(10);
+        if (rc_watchdog > 0) {
+            rc_watchdog--;
+            status &= ~WARN_RC_TIMEOUT;
+        }
+        else {
+            status |= WARN_RC_TIMEOUT;
+        }
+
+        cli(); rc_pulse = _rc_pulse; sei();
+        
+        // Reference values
+        //
+        pwm_ref = 0;  // Normalized to -255 .. 255
+
+        if (!(status & WARN_I2C_TIMEOUT)) {
+            pwm_ref = ((int8_t)i2c_data[0]) * 2;
+        }
+
+        if (!(status & WARN_RC_TIMEOUT)) {
+            if (rc_pulse > 750 && rc_pulse < 2250) {
+                // RC input overrides I2C commands
+                //
+                pwm_ref = (rc_pulse - 1560) * 256L / 300;
+            }
+        }
+
+        if (status & ERR_MASK) {
+            // Switch off in case of any error
+            //
+            pwm_ref = 0;
+        }
+
+        pwm_ref = clamp(pwm_ref, -255, 255);
+        pwm_act = clamp(pwm_ref, pwm_act - 1, pwm_act + 1);
+
+        outputs = i2c_data[1];
+
+        // Actual values
+        //
+        i2c_data[2] = status;
+        i2c_data[3] = pwm_act >> 1;
+        
+        i2c_data[4] = u_bat_mv & 0xFF;
+        i2c_data[5] = u_bat_mv >> 8;
+
+        i2c_data[6] = rc_pulse & 0xFF;
+        i2c_data[7] = rc_pulse >> 8;
+
+        set_pwm( ((long)pwm_act * PWM_PERIOD) / 255 );
+
+        _delay_ms(1);
     }
 }
